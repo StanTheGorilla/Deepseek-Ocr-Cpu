@@ -1,0 +1,26 @@
+# Python ignores
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# Virtual environments
+venv/
+deepseek-ocr-envdeepseek-ocr-env/
+
+# Output and logs
+output/
+*.log
+
+# Miscellaneous
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+
+# Large files or models
+*.pdf
+0.26.0
+DeepSeek-OCR-master/
