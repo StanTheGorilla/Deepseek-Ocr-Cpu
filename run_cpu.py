@@ -23,14 +23,136 @@ import json
 from pathlib import Path
 from collections import defaultdict
 import multiprocessing
+import argparse
+import warnings
+import sys
+import io
+import logging
+from transformers import logging as hf_logging
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Disable HuggingFace progress bars
+hf_logging.set_verbosity_error()
+hf_logging.disable_progress_bar()
+# Globally disable tqdm-style progress bars that may write to stderr
+os.environ["TQDM_DISABLE"] = "1"
+# Reduce logs
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("accelerate").setLevel(logging.ERROR)
+logging.getLogger("torch").setLevel(logging.ERROR)
+
+# AGGRESSIVE WARNING SUPPRESSION - BLOCK STDERR OUTPUT DIRECTLY
+# These warnings are harmless but clutter the interface and bypass warnings.filterwarnings
+
+# First, save the original stderr
+original_stderr = sys.stderr
+
+class CleanStderr(io.TextIOWrapper):
+    """Custom stderr wrapper that filters out warning messages"""
+    
+    def __init__(self, buffer):
+        super().__init__(buffer, write_through=True)
+    
+    def write(self, text):
+        # Short-circuit empty writes
+        if not text:
+            return 0
+        # Normalize
+        lowered = text.lower()
+        stripped = text.strip()
+        
+        # Suppress common tqdm-like progress outputs that sometimes print to stderr
+        # e.g., "image: 0it [00:00, ?it/s]" or "other: 0it [00:00, ?it/s]"
+        if (
+            '\r' in text and ("image:" in lowered or "other:" in lowered)
+            or re.search(r"^(image|other):\s*\d+it\s*\[.*\]", stripped, re.IGNORECASE)
+            or "0it [00:00" in lowered
+            or "it/s" in lowered
+        ):
+            return 0
+        
+        # List of warning patterns to suppress
+        warning_patterns = [
+            # Exact messages
+            "The attention mask and the pad token id were not set.",
+            "Please pass your input's `attention_mask` to obtain reliable results.",
+            "Setting `pad_token_id` to `eos_token_id`",
+            "The attention mask is not set and cannot be inferred",
+            "As a consequence, you may observe unexpected behavior",
+            "The `seen_tokens` attribute is deprecated",
+            "Use the `cache_position` model input instead.",
+            "`get_max_cache()` is deprecated",
+            "Calling `get_max_cache()` will raise error",
+            "Use `get_max_cache_shape()` instead.",
+            "The attention layers in this model are transitioning",
+            "`position_ids` will be removed",
+            "`position_embeddings` will be mandatory",
+            # Key substrings to catch variants
+            "attention mask",
+            "pad token id",
+            "eos_token_id",
+            "open-end generation",
+            "seen_tokens",
+            "cache_position",
+            "get_max_cache",
+            "RoPE embeddings",
+            "position_ids",
+            "position_embeddings",
+        ]
+        
+        # Suppress if any pattern or all-lowercase variant is found
+        for pattern in warning_patterns:
+            if pattern in text or pattern.lower() in lowered:
+                return 0
+        
+        # Also drop lines that look like framework warning prefixes
+        # (e.g., UserWarning, FutureWarning, DeprecationWarning)
+        if any(prefix in text for prefix in ["UserWarning", "FutureWarning", "DeprecationWarning"]):
+            return 0
+        
+        # Write everything else normally
+        return super().write(text)
+
+# Replace stderr with our filtering wrapper
+sys.stderr = CleanStderr(sys.stderr.buffer)
+
+# Also suppress Python warnings (redundant but ensures complete coverage)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*attention mask.*")
+warnings.filterwarnings("ignore", message=".*deprecated.*")
+warnings.filterwarnings("ignore", message=".*get_max_cache.*")
+warnings.filterwarnings("ignore", message=".*position_ids.*")
 
 def clean_output(text):
-    """Clean up output by removing tags and formatting issues"""
+    """Clean up output by removing tags, collapsing separators, and normalizing spacing"""
     if not isinstance(text, str):
         text = str(text)
     
+    # Remove image tags
     text = re.sub(r'</?image>', '', text)
     text = re.sub(r'</image>.*', '', text, flags=re.DOTALL)
+    
+    # Collapse stacked separator lines into a single inline line
+    lines = [l for l in text.split('\n')]
+    processed = []
+    sep_run = []
+    for l in lines:
+        if re.fullmatch(r'[=\-]{3,}', l.strip()):
+            sep_run.append(l.strip())
+            continue
+        # flush any pending sep_run
+        if sep_run:
+            # choose max length seen, cap at 80
+            max_len = min(max(len(s) for s in sep_run), 80)
+            processed.append('=' * max_len)
+            sep_run = []
+        processed.append(l)
+    # flush at end
+    if sep_run:
+        max_len = min(max(len(s) for s in sep_run), 80)
+        processed.append('=' * max_len)
+    
+    # Join and normalize excessive blank lines
+    text = '\n'.join(processed)
     text = re.sub(r'\n{3,}', '\n\n', text)
     
     return text.strip()
@@ -258,365 +380,70 @@ class ParallelProcessor:
         """Extract response from model output - IMPROVED filtering"""
         response_text = None
         
-        # Check direct result
+        # Method 1: direct result
         if result is not None:
             if isinstance(result, dict):
-                response_text = result.get('text', result.get('output', result.get('response')))
-            elif isinstance(result, str) and len(result.strip()) > 10:
+                for key in ("text", "output", "response", "generated_text", "content"):
+                    val = result.get(key)
+                    if isinstance(val, str) and len(val.strip()) > 0:
+                        response_text = val
+                        break
+            elif isinstance(result, str) and len(result.strip()) > 0:
                 response_text = result
-        
-        # Check captured stdout - ONLY filter technical messages, preserve ALL content
-        if not response_text and captured_text and len(captured_text.strip()) > 10:
-            lines = [line.strip() for line in captured_text.split('\n') if line.strip()]
-            
-            # MINIMAL filtering - ONLY remove PyTorch/system technical messages
-            technical_prefixes = (
-                'The attention', 'Setting', 'The `seen', 'UserWarning:', 'FutureWarning:',
-                'BASE:', 'NO PATCHES', 'torch.Size', 'warnings.warn', 'DeprecationWarning',
-                'You are using', 'Some weights', 'You should probably TRAIN', 'get_max_cache',
-                'The attention layers', 'The `seen_tokens`', 'The attention mask',
-                'Setting `pad_token_id`', 'User provided device_type'
-            )
-            
-            # Filter ONLY technical PyTorch messages, keep EVERYTHING else
-            content_lines = [
-                line for line in lines 
-                if not any(line.startswith(prefix) for prefix in technical_prefixes)
-                and len(line) > 1  # Only exclude empty/single-char lines
-            ]
-            
-            # Use ALL filtered content - no length requirements, no content-based filtering
-            if content_lines:
-                response_text = '\n'.join(content_lines)
-        
-        # Check saved files - IMPROVED
-        if not response_text:
-            try:
-                result_files = [f for f in os.listdir(output_dir) if f.endswith('.txt')]
-                for txt_file in sorted(result_files, key=lambda f: os.path.getmtime(os.path.join(output_dir, f)), reverse=True):
-                    file_path = os.path.join(output_dir, txt_file)
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            content = f.read().strip()
-                            if (len(content) > 50 and 'error' not in content.lower() and
-                                'BASE:' not in content and 'torch.Size' not in content):
-                                response_text = content
-                                break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-        
-        return response_text
-
-class OptimizedChatSession:
-    def __init__(self, model, tokenizer):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.conversation_history = []
-        self.current_image = None
-        
-        # Initialize parallel processor
-        self.parallel_processor = ParallelProcessor(model, tokenizer)
-        
-        # DIRECT SYSTEM PROMPT - Complete, uncensored analysis
-        self.system_prompt = "Describe everything in this image completely and directly. Extract all text exactly as shown without filtering or censoring. Be thorough and accurate."
-        
-    def load_image(self, image_path):
-        """Load and optimize image for processing"""
-        if not os.path.exists(image_path):
-            return False, f"❌ Image file not found: {image_path}"
-        
-        try:
-            img = Image.open(image_path)
-            
-            # Optimize image for processing (resize if very large, but maintain quality)
-            if img.size[0] > 2048 or img.size[1] > 2048:
-                # Maintain aspect ratio while optimizing
-                img.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
-                print(f"  📐 Image resized to {img.size[0]}x{img.size[1]} for optimal processing")
-            
-            self.current_image = image_path
-            return True, f"✅ Image loaded: {os.path.basename(image_path)} | Size: {img.size[0]}x{img.size[1]} pixels"
-        except Exception as e:
-            return False, f"❌ Error loading image: {e}"
-    
-    def load_multiple_images(self, image_paths):
-        """Load multiple images for batch processing"""
-        loaded_images = []
-        failed_images = []
-        
-        for path in image_paths:
-            if os.path.exists(path):
+            else:
                 try:
-                    img = Image.open(path)
-                    loaded_images.append(path)
-                except Exception as e:
-                    failed_images.append((path, str(e)))
-            else:
-                failed_images.append((path, "File not found"))
+                    s = str(result).strip()
+                    if len(s) > 0:
+                        response_text = s
+                except Exception:
+                    pass
         
-        if failed_images:
-            print(f"⚠️ Failed to load {len(failed_images)} images:")
-            for path, error in failed_images:
-                print(f"  {os.path.basename(path)}: {error}")
-        
-        print(f"✅ Successfully loaded {len(loaded_images)} images for parallel processing")
-        return loaded_images
-    
-    def preprocess_image(self, image_path):
-        """Preprocess image for optimal model performance"""
-        try:
-            with Image.open(image_path) as img:
-                # Convert to RGB if necessary
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                
-                # Apply slight enhancement for better text recognition
-                from PIL import ImageEnhance
-                enhancer = ImageEnhance.Contrast(img)
-                img = enhancer.enhance(1.1)  # Slight contrast boost
-                
-                enhancer = ImageEnhance.Sharpness(img)
-                img = enhancer.enhance(1.05)  # Slight sharpness boost
-                
-                return img
-        except Exception as e:
-            print(f"  ⚠️ Image preprocessing warning: {e}")
-            return Image.open(image_path)
-    
-    def chat(self, user_message):
-        """Enhanced chat with maximum accuracy and efficiency"""
-        if not self.current_image:
-            return "❌ No image loaded. Use 'load <path>' to load an image first."
-        
-        # Check if this is a position-related query
-        is_position_query = detect_position_query(user_message)
-        
-        # Always use maximum quality settings for best accuracy
-        max_settings = {
-            "base_size": 1280,
-            "image_size": 1280,
-            "name": "Maximum Quality (1280x1280)"
-        }
-        
-        # Enhanced prompt for position queries
-        if is_position_query:
-            full_prompt = f"""<image>
-Analyze this image and describe:
-- All visible text and their positions (top, middle, bottom, left, right, center)
-- Layout and spatial arrangement of elements
-- Exact text content without filtering or censoring
-- Detailed position information
-
-{user_message}"""
-        else:
-            # Direct, uncensored prompt for regular queries
-            full_prompt = f"<image>\nDescribe everything you see in this image in complete detail. Extract all text exactly as shown, without filtering or censoring any content. Be direct and thorough.\n\n{user_message}"
-        
-        try:
-            # Optimize threading for CPU
-            cpu_count = multiprocessing.cpu_count()
-            physical_cores = cpu_count // 2
-            optimal_threads = min(physical_cores * 2, cpu_count, 16)
-            
-            torch.set_num_threads(optimal_threads)
-            
-            # Preprocess image for better results
-            processed_img = self.preprocess_image(self.current_image)
-            
-            # Memory management before inference
-            gc.collect()
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            
-            # Capture output more reliably
-            import io
-            import sys
-            
-            output_dir = './output'
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Redirect stdout to capture print statements
-            old_stdout = sys.stdout
-            sys.stdout = captured_output = io.StringIO()
-            
-            try:
-                # Enhanced inference with better error handling
-                result = self.model.infer(
-                    self.tokenizer,
-                    prompt=full_prompt,
-                    image_file=self.current_image,
-                    output_path=output_dir,
-                    base_size=max_settings["base_size"],
-                    image_size=max_settings["image_size"],
-                    crop_mode=False,
-                    save_results=True,
-                    test_compress=False
-                )
-            finally:
-                # Restore stdout
-                sys.stdout = old_stdout
-                captured_text = captured_output.getvalue()
-            
-            # Enhanced result extraction with multiple fallback methods
-            response_text = self.extract_response(result, captured_text, output_dir)
-            
-            if not response_text:
-                return "⚠️ Model returned empty response. Try with a simpler query or restart the application."
-            
-            cleaned_res = clean_output(response_text)
-            
-            # Apply spatial formatting for position queries
-            if is_position_query:
-                spatial_output = create_spatial_text_map(cleaned_res)
-                final_response = f"{cleaned_res}\n\n{spatial_output}"
-            else:
-                final_response = cleaned_res
-            
-            # Save to history with metadata
-            self.conversation_history.append({
-                "timestamp": datetime.now().strftime("%H:%M:%S"),
-                "user": user_message,
-                "assistant": final_response,
-                "quality": max_settings['name'],
-                "image_size": processed_img.size if 'processed_img' in locals() else "Unknown",
-                "query_type": "position" if is_position_query else "regular"
-            })
-            
-            # Memory cleanup after inference
-            gc.collect()
-            
-            return final_response
-            
-        except Exception as e:
-            return f"❌ Error: {str(e)}"
-    
-    def chat_parallel(self, user_message, image_paths=None):
-        """Process multiple images in parallel with the same query"""
-        if image_paths is None:
-            if not self.current_image:
-                return "❌ No image loaded. Use 'load <path>' to load an image first."
-            image_paths = [self.current_image]
-        
-        # Use parallel processor
-        results = self.parallel_processor.process_image_batch(image_paths, [user_message] * len(image_paths))
-        
-        # Save to history
-        self.conversation_history.append({
-            "timestamp": datetime.now().strftime("%H:%M:%S"),
-            "user": user_message,
-            "assistant": "BATCH ANALYSIS:\n" + "\n\n".join(results),
-            "quality": "Parallel Processing",
-            "image_count": len(image_paths)
-        })
-        
-        return "PARALLEL ANALYSIS RESULTS:\n" + "\n\n" + "="*60 + "\n".join([f"Image {i+1}: {os.path.basename(path)}\n{result}" for i, (path, result) in enumerate(zip(image_paths, results))])
-    
-    def extract_response(self, result, captured_text, output_dir):
-        """Enhanced response extraction - UNCENSORED, minimal filtering"""
-        response_text = None
-        
-        # Method 1: Check direct result
-        if result is not None:
-            if isinstance(result, dict):
-                response_text = result.get('text', result.get('output', result.get('response', result.get('generated_text'))))
-            elif isinstance(result, str) and len(result.strip()) > 10:
-                response_text = result
-            elif hasattr(result, '__str__') and len(str(result).strip()) > 10:
-                response_text = str(result)
-        
-        # Method 2: Parse captured stdout - ONLY filter technical PyTorch messages
-        if not response_text and captured_text and len(captured_text.strip()) > 10:
+        # Method 2: captured stdout - filter only technical/separator noise
+        if not response_text and captured_text and len(captured_text.strip()) > 0:
+            # Remove carriage-return progress updates inline
+            captured_text = re.sub(r"\r?\n?\s*(image|other):\s*\d+it\s*\[.*?\]\s*", "", captured_text, flags=re.IGNORECASE)
+            captured_text = re.sub(r"\r", "", captured_text)
+            captured_text = captured_text.replace("0it [00:00", "").replace("it/s]", "")
             lines = [line.strip() for line in captured_text.split('\n') if line.strip()]
-            
-            # MINIMAL filtering - ONLY remove PyTorch/system technical messages
             technical_prefixes = (
                 'The attention', 'Setting', 'The `seen', 'UserWarning:', 'FutureWarning:',
                 'BASE:', 'NO PATCHES', 'torch.Size', 'warnings.warn', 'DeprecationWarning',
                 'You are using', 'Some weights', 'You should probably TRAIN', 'get_max_cache',
                 'The attention layers', 'The `seen_tokens`', 'The attention mask',
-                'Setting `pad_token_id`', 'User provided device_type'
+                'Setting `pad_token_id`', 'User provided device_type', 'image:', 'other:',
+                'it/s]', '0it [00:00', 'As a consequence',
             )
-            
-            # Filter ONLY technical PyTorch messages, keep EVERYTHING else
             content_lines = [
-                line for line in lines 
+                line for line in lines
                 if not any(line.startswith(prefix) for prefix in technical_prefixes)
-                and len(line) > 1  # Only exclude empty/single-char lines
+                and len(line) > 1
+                and 'it/s]' not in line
+                and 'it [00:00' not in line
+                and 'save results' not in line.lower()
+                and 'save_results' not in line.lower()
+                and not re.fullmatch(r'[=\-]{3,}', line)
             ]
-            
-            # Use ALL filtered content - no length requirements, no content-based filtering
             if content_lines:
                 response_text = '\n'.join(content_lines)
         
-        # Method 3: Check saved files - UNCENSORED
+        # Method 3: saved files fallback
         if not response_text:
             try:
                 file_patterns = ['result_', 'output_', 'generation_']
-                result_files = []
-                
-                for file in os.listdir(output_dir):
-                    if file.endswith('.txt') and any(pattern in file for pattern in file_patterns):
-                        result_files.append(file)
-                
-                if result_files:
-                    latest_file = max([os.path.join(output_dir, f) for f in result_files], key=os.path.getmtime)
-                    with open(latest_file, 'r', encoding='utf-8') as f:
-                        file_content = f.read().strip()
-                        if len(file_content) > 10 and 'error' not in file_content.lower():
-                            # Minimal filtering on file content too
-                            lines = [line.strip() for line in file_content.split('\n') if line.strip()]
-                            cleaned_lines = [
-                                line for line in lines 
-                                if not any(line.startswith(prefix) for prefix in technical_prefixes)
-                                and len(line) > 1
-                            ]
-                            if cleaned_lines:
-                                response_text = '\n'.join(cleaned_lines)
-                            else:
-                                response_text = file_content
+                candidate_files = [
+                    f for f in os.listdir(output_dir)
+                    if f.endswith('.txt') and any(p in f for p in file_patterns)
+                ]
+                if candidate_files:
+                    latest_file = max([os.path.join(output_dir, f) for f in candidate_files], key=os.path.getmtime)
+                    with open(latest_file, 'r', encoding='utf-8') as fp:
+                        content = fp.read().strip()
+                        if content:
+                            lines = [ln.strip() for ln in content.split('\n') if ln.strip()]
+                            cleaned = [ln for ln in lines if len(ln) > 1 and not re.fullmatch(r'[=\-]{3,}', ln)]
+                            response_text = '\n'.join(cleaned) if cleaned else content
             except Exception:
                 pass
-        
-        # Method 4: Search for any text files in output directory - UNCENSORED
-        if not response_text:
-            try:
-                txt_files = [f for f in os.listdir(output_dir) if f.endswith('.txt')]
-                for txt_file in sorted(txt_files, key=lambda f: os.path.getmtime(os.path.join(output_dir, f)), reverse=True):
-                    file_path = os.path.join(output_dir, txt_file)
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            content = f.read().strip()
-                            # Accept ANY content that's not purely technical errors
-                            if (len(content) > 10 and 
-                                'BASE:' not in content and 'torch.Size' not in content):
-                                response_text = content
-                                break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-        
-        # Fallback: Try to extract meaningful text from any source
-        if not response_text:
-            # Look for any text that doesn't look like technical output
-            all_text = captured_text if captured_text else str(result) if result else ""
-            lines = [line.strip() for line in all_text.split('\n') if line.strip()]
-            
-            # Find lines that look like actual text analysis (longer, meaningful content)
-            text_lines = []
-            for line in lines:
-                # Skip technical lines
-                if (len(line) > 10 and 
-                    not any(line.startswith(prefix) for prefix in technical_prefixes) and
-                    not line.startswith('💾') and not line.startswith('CPU:') and
-                    'torch.Size' not in line and 'BASE:' not in line and
-                    not line.strip().isdigit()):
-                    text_lines.append(line)
-            
-            if text_lines:
-                response_text = '\n'.join(text_lines[:10])  # Take first 10 meaningful lines
-        
         return response_text
 
 def print_banner():
@@ -627,6 +454,9 @@ def print_banner():
     print("  ⚡ OPTIMIZED FOR MAXIMUM ACCURACY & PARALLEL PERFORMANCE")
     print("  🚀 Multi-threaded processing with intelligent batch handling")
     print("="*80)
+    print("\n📖 USAGE: python run_cpu_parallel.py <path_to_image>")
+    print("💡 During chat: Use 'load <path>' to change image anytime")
+    print("="*80)
 
 def print_help():
     """Display enhanced help information"""
@@ -635,7 +465,7 @@ def print_help():
     print("="*80)
     print("  Just type naturally to ask about the image!")
     print()
-    print("  load <path>        Load a new image")
+    print("  load <path>        Load a new image (replaces current image)")
     print("  batch <paths...>   Load multiple images for parallel processing")
     print("  parallel <query>   Process all loaded images with same query")
     print("  compare <query>    Compare analysis across multiple images")
@@ -653,10 +483,10 @@ def print_help():
     print("  • Enhanced memory utilization (18-22GB RAM)")
     print("  • Optimized for your 8-core/16-thread Ryzen 7 5700G")
     print("="*80)
-    print("\n📝 CONFIGURATION:")
-    print("  • Set default image path in code (see comments in main() function)")
-    print("  • Configure multiple images for automatic batch loading")
-    print("  • Images load automatically on program startup")
+    print("\n📖 USAGE:")
+    print("  • Start: python run_cpu_parallel.py <path_to_image>")
+    print("  • During chat: Use 'load <path>' to change image anytime")
+    print("  • Multiple images: Use 'batch' command for parallel processing")
     print("="*80)
 
 # System monitoring functions removed for clean interface
@@ -674,6 +504,18 @@ def find_images_in_directory(directory):
     return found_images
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='DeepSeek OCR Chat Interface')
+    parser.add_argument('image_path', nargs='?', help='Path to the image to analyze')
+    args = parser.parse_args()
+    
+    # Validate image path early if provided
+    if args.image_path and not os.path.exists(args.image_path):
+        print(f"\n❌ Image not found: {args.image_path}")
+        print("💡 Usage: python run_cpu.py <path_to_image>")
+        print("💡 Or use: python run_cpu.py (then use 'load' command)")
+        return
+    
     # Load model with enhanced settings
     model_name = 'deepseek-ai/DeepSeek-OCR'
     print_banner()
@@ -716,39 +558,35 @@ def main():
     session = OptimizedChatSession(model, tokenizer)
     
     # =================== IMAGE PATH CONFIGURATION ===================
-    # 📝 CONFIGURE YOUR DEFAULT IMAGES HERE:
-    # 
-    # Option 1: Single image (uncomment and modify the path below)
-    default_image = "/workspace/user_input_files/image.png"  # <-- CHANGE THIS PATH
-    # 
-    # Option 2: Multiple images for batch processing (uncomment the section below)
-    # default_images = [
-    #     r"C:\Users\YourName\Documents\image1.jpg",
-    #     r"C:\Users\YourName\Documents\image2.jpg", 
-    #     r"C:\Users\YourName\Documents\image3.jpg"
-    # ]
-    # 
-    # 📋 After configuring, the program will automatically load your images on startup
-    # ================================================================
-    
-    # Load default image(s)
-    if 'default_images' in locals() and default_images:
-        loaded_images = session.load_multiple_images(default_images)
-        if loaded_images:
-            print(f"✅ Loaded {len(loaded_images)} default images for parallel processing:")
-            for img_path in loaded_images:
-                print(f"  📁 {os.path.basename(img_path)}")
-    elif os.path.exists(default_image):
-        success, msg = session.load_image(default_image)
-        print(msg)
+    # Load image from command line argument or use default
+    if args.image_path:
+        # Use command line provided image
+        if os.path.exists(args.image_path):
+            success, msg = session.load_image(args.image_path)
+            print(f"\n🖼️ Loaded image from command line: {args.image_path}")
+            print(msg)
+        else:
+            print(f"\n❌ Image not found: {args.image_path}")
+            print("💡 Usage: python run_cpu.py <path_to_image>")
+            print("💡 Or use: python run_cpu.py (then use 'load' command)")
+            return
     else:
-        print("💡 Use 'load <path>' to load an image or 'batch <paths...>' for multiple images")
-        print(f"💡 Set your default image path in the code: default_image = \"{default_image}\"")
+        # Use default image from code (legacy behavior)
+        default_image = "/workspace/user_input_files/image.png"
+        if os.path.exists(default_image):
+            success, msg = session.load_image(default_image)
+            print(msg)
+        else:
+            print("💡 No image provided. Use one of these methods:")
+            print("   python run_cpu.py <path_to_image>")
+            print("   python run_cpu.py (then use 'load' command)")
+            print("💡 Set default image path in code if needed")
     
-    print("\n💬 Start chatting! Ask anything about your image(s).")
-    print("🔍 System automatically uses maximum accuracy settings")
-    print("🚀 Use 'parallel' command for batch processing multiple images")
-    print(f"📁 Default image: {os.path.basename(default_image)} (change in code if needed)\n")
+    print("\n💬 Start chatting! Ask anything about your image.")
+    print("🔧 System automatically uses maximum accuracy settings")
+    print("🖼️ Use 'load <path>' anytime to change the current image")
+    print("🚀 Use 'batch <paths...>' for parallel processing multiple images")
+    print("ℹ️ Type 'quit' to exit\n")
     
     # Main chat loop
     while True:
@@ -800,7 +638,7 @@ def main():
                 
                 loaded_images = session.load_multiple_images(expanded_paths)
                 if loaded_images:
-                    print(f"\n📁 Loaded {len(loaded_images)} images for parallel processing")
+                    print(f"\n🖼️ Loaded {len(loaded_images)} images for parallel processing")
                 continue
             
             elif cmd.startswith('parallel '):
@@ -816,16 +654,9 @@ def main():
                         print("\n❌ No images loaded for parallel processing. Use 'batch' command first.")
                         continue
                 
-                print(f"\n🚀 Processing {len(image_paths)} images in parallel...")
                 results = session.parallel_processor.process_image_batch(image_paths, [query] * len(image_paths))
-                
-                print(f"\n🤖 Parallel Analysis Results:")
-                print("=" * 80)
-                for i, (path, result) in enumerate(zip(image_paths, results)):
-                    print(f"\n📸 Image {i+1}: {os.path.basename(path)}")
-                    print("-" * 40)
-                    print(result)
-                    print("\n" + "=" * 80)
+                for result in results:
+                    print(f"answer: {result}")
                 continue
             
             elif cmd.startswith('compare '):
@@ -833,15 +664,9 @@ def main():
                 # Similar to parallel but for comparison
                 if hasattr(session, 'loaded_images') and session.loaded_images:
                     image_paths = session.loaded_images
-                    print(f"\n⚖️ Comparing {len(image_paths)} images with query: {query}")
                     results = session.parallel_processor.process_image_batch(image_paths, [query] * len(image_paths))
-                    
-                    print(f"\n🔍 Comparison Analysis:")
-                    print("=" * 80)
-                    for i, (path, result) in enumerate(zip(image_paths, results)):
-                        print(f"\n📊 {os.path.basename(path)}")
-                        print("-" * 40)
-                        print(result)
+                    for result in results:
+                        print(f"answer: {result}")
                 else:
                     print("\n❌ No images loaded for comparison. Use 'batch' command first.")
                 continue
@@ -858,7 +683,7 @@ def main():
                     
                     # Show loaded images count if batch processing
                     if hasattr(session, 'loaded_images') and session.loaded_images:
-                        print(f"\n📁 Batch images loaded: {len(session.loaded_images)}")
+                        print(f"\n🖼️ Batch images loaded: {len(session.loaded_images)}")
                 else:
                     print("\n❌ No image loaded")
                 continue
@@ -872,8 +697,8 @@ def main():
                     for i, msg in enumerate(session.conversation_history, 1):
                         print(f"\n[{msg['timestamp']}] #{i}")
                         print(f"You: {msg['user']}")
-                        preview = msg['assistant'][:200]
-                        if len(msg['assistant']) > 200:
+                        preview = str(msg['assistant'])[:200]
+                        if len(str(msg['assistant'])) > 200:
                             preview += "..."
                         print(f"Assistant: {preview}")
                 continue
@@ -912,18 +737,11 @@ def main():
             # System monitoring removed for clean interface
             
             # Direct chat - always maximum quality
-            print(f"\n🧠 Analyzing with maximum accuracy...")
             response = session.chat(user_input)
-            
-            print(f"\n🤖 Enhanced Analysis:\n{response}")
-            
-            # Enhanced statistics
-            words = len(response.split())
-            chars = len(response)
-            print(f"\n📊 Analysis Stats: {words} words, {chars} characters")
+            print(f"answer: {response}")
             
         except KeyboardInterrupt:
-            print("\n\n⚠️  Interrupted. Type 'quit' to exit or press Enter to continue...")
+            print("\n\n⚠️ Interrupted. Type 'quit' to exit or press Enter to continue...")
             try:
                 cont = input().strip().lower()
                 if cont in ['quit', 'exit', 'q']:
@@ -945,5 +763,197 @@ def main():
     print("\n🔧 Cleaning up resources...")
     gc.collect()
 
+
+class OptimizedChatSession:
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.conversation_history = []
+        self.current_image = None
+        self.loaded_images = []
+        self.parallel_processor = ParallelProcessor(model, tokenizer)
+        # Direct, uncensored system prompt
+        self.system_prompt = (
+            "Describe everything in this image completely and directly. "
+            "Extract all text exactly as shown without filtering or censoring. Be thorough and accurate."
+        )
+    
+    def load_image(self, image_path):
+        if not os.path.exists(image_path):
+            return False, f"❌ Image file not found: {image_path}"
+        try:
+            img = Image.open(image_path)
+            # Optimize very large images
+            if img.size[0] > 2048 or img.size[1] > 2048:
+                img.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+                print(f"  🔧 Image resized to {img.size[0]}x{img.size[1]} for optimal processing")
+            self.current_image = image_path
+            return True, f"✅ Image loaded: {os.path.basename(image_path)} | Size: {img.size[0]}x{img.size[1]} pixels"
+        except Exception as e:
+            return False, f"❌ Error loading image: {e}"
+    
+    def load_multiple_images(self, image_paths):
+        loaded_images = []
+        failed_images = []
+        for path in image_paths:
+            if os.path.exists(path):
+                try:
+                    Image.open(path)  # validate
+                    loaded_images.append(path)
+                except Exception as e:
+                    failed_images.append((path, str(e)))
+            else:
+                failed_images.append((path, "File not found"))
+        self.loaded_images = loaded_images
+        if failed_images:
+            print(f"⚠️ Failed to load {len(failed_images)} images:")
+            for p, err in failed_images:
+                print(f"  {os.path.basename(p)}: {err}")
+        print(f"✅ Successfully loaded {len(loaded_images)} images for parallel processing")
+        return loaded_images
+    
+    def preprocess_image(self, image_path):
+        try:
+            with Image.open(image_path) as img:
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                from PIL import ImageEnhance
+                img = ImageEnhance.Contrast(img).enhance(1.1)
+                img = ImageEnhance.Sharpness(img).enhance(1.05)
+                return img
+        except Exception as e:
+            print(f"  ⚠️ Image preprocessing warning: {e}")
+            return Image.open(image_path)
+    
+    def chat(self, user_message):
+        if not self.current_image:
+            return "❌ No image loaded. Use 'load <path>' to load an image first."
+        is_position_query = detect_position_query(user_message)
+        max_settings = {"base_size": 1280, "image_size": 1280, "name": "Maximum Quality (1280x1280)"}
+        if is_position_query:
+            full_prompt = (
+                "<image>\nAnalyze this image and describe:\n"
+                "- All visible text and their positions (top, middle, bottom, left, right, center)\n"
+                "- Layout and spatial arrangement of elements\n"
+                "- Exact text content without filtering or censoring\n"
+                "- Detailed position information\n\n" + user_message
+            )
+        else:
+            full_prompt = (
+                "<image>\nDescribe everything you see in this image in complete detail. "
+                "Extract all text exactly as shown, without filtering or censoring any content. "
+                "Be direct and thorough.\n\n" + user_message
+            )
+        try:
+            cpu_count = multiprocessing.cpu_count()
+            physical_cores = max(cpu_count // 2, 1)
+            optimal_threads = min(physical_cores * 2, cpu_count, 16)
+            torch.set_num_threads(optimal_threads)
+            processed_img = self.preprocess_image(self.current_image)
+            gc.collect()
+            # capture stdout
+            old_stdout = sys.stdout
+            sys.stdout = captured = io.StringIO()
+            output_dir = './output'
+            os.makedirs(output_dir, exist_ok=True)
+            try:
+                result = self.model.infer(
+                    self.tokenizer,
+                    prompt=full_prompt,
+                    image_file=self.current_image,
+                    output_path=output_dir,
+                    base_size=max_settings["base_size"],
+                    image_size=max_settings["image_size"],
+                    crop_mode=False,
+                    save_results=True,
+                    test_compress=False
+                )
+            finally:
+                sys.stdout = old_stdout
+                captured_text = captured.getvalue()
+            response_text = self.extract_response(result, captured_text, output_dir)
+            if not response_text:
+                return "⚠️ Model returned empty response. Try with a simpler query or restart the application."
+            cleaned_res = clean_output(response_text)
+            if is_position_query:
+                spatial_output = create_spatial_text_map(cleaned_res)
+                final_response = f"{cleaned_res}\n\n{spatial_output}"
+            else:
+                final_response = cleaned_res
+            self.conversation_history.append({
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "user": user_message,
+                "assistant": final_response,
+                "quality": max_settings['name'],
+                "image_size": processed_img.size if hasattr(processed_img, 'size') else "Unknown",
+                "query_type": "position" if is_position_query else "regular"
+            })
+            gc.collect()
+            return final_response
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def extract_response(self, result, captured_text, output_dir):
+        """UNCENSORED response extraction with minimal filtering and separator cleanup"""
+        response_text = None
+        if result is not None:
+            if isinstance(result, dict):
+                for key in ("text", "output", "response", "generated_text", "content"):
+                    v = result.get(key)
+                    if isinstance(v, str) and v.strip():
+                        response_text = v
+                        break
+            elif isinstance(result, str) and result.strip():
+                response_text = result
+            else:
+                try:
+                    s = str(result).strip()
+                    if s:
+                        response_text = s
+                except Exception:
+                    pass
+        if not response_text and captured_text and captured_text.strip():
+            # Remove carriage-return progress updates inline
+            captured_text = re.sub(r"\r?\n?\s*(image|other):\s*\d+it\s*\[.*?\]\s*", "", captured_text, flags=re.IGNORECASE)
+            captured_text = re.sub(r"\r", "", captured_text)
+            captured_text = captured_text.replace("0it [00:00", "").replace("it/s]", "")
+            lines = [ln.strip() for ln in captured_text.split('\n') if ln.strip()]
+            technical_prefixes = (
+                'The attention', 'Setting', 'The `seen', 'UserWarning:', 'FutureWarning:',
+                'BASE:', 'NO PATCHES', 'torch.Size', 'warnings.warn', 'DeprecationWarning',
+                'You are using', 'Some weights', 'You should probably TRAIN', 'get_max_cache',
+                'The attention layers', 'The `seen_tokens`', 'The attention mask',
+                'Setting `pad_token_id`', 'User provided device_type', 'image:', 'other:',
+                'it/s]', '0it [00:00', 'As a consequence'
+            )
+            content_lines = [
+                ln for ln in lines
+                if not any(ln.startswith(p) for p in technical_prefixes)
+                and len(ln) > 1
+                and 'it/s]' not in ln
+                and 'it [00:00' not in ln
+                and 'save results' not in ln.lower()
+                and 'save_results' not in ln.lower()
+                and not re.fullmatch(r'[=\-]{3,}', ln)
+            ]
+            if content_lines:
+                response_text = '\n'.join(content_lines)
+        if not response_text:
+            try:
+                file_patterns = ['result_', 'output_', 'generation_']
+                candidates = [f for f in os.listdir(output_dir) if f.endswith('.txt') and any(p in f for p in file_patterns)]
+                if candidates:
+                    latest = max([os.path.join(output_dir, f) for f in candidates], key=os.path.getmtime)
+                    with open(latest, 'r', encoding='utf-8') as fp:
+                        content = fp.read().strip()
+                        if content:
+                            lines = [ln.strip() for ln in content.split('\n') if ln.strip()]
+                            cleaned = [ln for ln in lines if len(ln) > 1 and not re.fullmatch(r'[=\-]{3,}', ln)]
+                            response_text = '\n'.join(cleaned) if cleaned else content
+            except Exception:
+                pass
+        return response_text
+
+# Append proper entrypoint at the end, after class definitions
 if __name__ == "__main__":
     main()
