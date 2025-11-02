@@ -10,7 +10,7 @@ Optional (installed automatically via requirements, but if you see ImportErrors)
 - torch / torchvision
 - addict
 
-## Installation (PowerShell)
+## Installation (cmd)
 1. Clone the repository:
    ```powershell
    git clone https://github.com/StanTheGorilla/Deepseek-Ocr-Cpu.git
